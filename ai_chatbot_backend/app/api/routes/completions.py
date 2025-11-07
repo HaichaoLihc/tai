@@ -102,6 +102,8 @@ async def create_completion(
         audio_response=params.audio_response,
         sid=sid
     )
+    
+    create_or_update_memory_synopsis(sid, response)
 
     if params.stream:
         return StreamingResponse(
