@@ -93,6 +93,8 @@ def build_augmented_prompt(
       - modified_message: the augmented instruction prompt.
       - reference_list: list of reference URLs for JSON output.
     """
+    # Use centralized configuration
+    json_output = settings.JSON_OUTPUT
     # Practice mode has its own message format
     if answer_content and problem_content:
         user_message = (
