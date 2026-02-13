@@ -5,6 +5,8 @@ from dataclasses import dataclass, asdict, field
 from typing import Any, List, Optional
 # Third-party libraries
 from openai import OpenAI, AsyncOpenAI
+from vllm import SamplingParams
+from vllm.sampling_params import GuidedDecodingParams
 # Local libraries
 from app.core.models.chat_completion import Message
 from app.config import settings
@@ -29,7 +31,6 @@ MEMORY_SYNOPSIS_JSON_SCHEMA = {
     "additionalProperties": False
 }
 
-
 LTM_SCHEMA = {
     "type": "object",
     "properties": {
@@ -45,17 +46,75 @@ LTM_SCHEMA = {
                 "additionalProperties": False
             }
         },        
-        "current_focus": {"type": "string"},
-        "learning_preferences": {"type": "string"},
+        "current_focus": {
+            "type": "object",
+            "properties": {
+                "long_term_goals": {"type": "array", "items": {"type": "string"}},
+                "key_entries_of_interest": {"type": "array", "items": {"type": "string"}},
+                "persistent_open_questions": {"type": "array", "items": {"type": "string"}}
+            },
+            "additionalProperties": False
+        },
+        "learning_preferences": {
+            "type": "object",
+            "properties": {
+                "preferred_topics_and_interests": {"type": "array", "items": {"type": "string"}},
+                "preferred_learning_style": {"type": "string"},
+                "preferred_file_types": {"type": "array", "items": {"type": "string"}}
+            },
+            "additionalProperties": False
+        },
         "user_profile": {"type": "string"},
     },
-    "required": ["user_id", "knowledge_profile", "current_focus", "learning_preferences", "user_profile"],
     "additionalProperties": False
 }
-GUIDED_LTM = GuidedDecodingParams(json=LTM_SCHEMA)
-SAMPLING_JSON_LTM = SamplingParams(
-    temperature=0.0, top_p=1.0, max_tokens=8000, guided_decoding=GUIDED_LTM, skip_special_tokens=False
+
+_LLM_SYSTEM_LTM = (
+    "You are a Long-Term Memory (LTM) Synthesis Agent. Your goal is to evolve a student's cognitive model "
+    "by merging EXISTING_LTM, NEW_STM, and CHAT_HISTORY into a refined JSON. Prioritize behavioral "
+    "evidence and sentiment over static history.\n\n"
+
+    "CORE SYNTHESIS RULES:\n"
+    "1. Hierarchy of Evidence: USER input (Sentiment/Behavior) > NEW_STM (Session Facts) > EXISTING_LTM (History).\n"
+    "2. Knowledge Retention: Keep 'weak_topics' until the user demonstrates independent, scaffold-free mastery.\n\n"
+
+    "JSON SCHEMA GUIDELINES:\n"
+    "- knowledge_profile: { course_id: str, weak_topics: [str] }. \n"
+    "  Logic: Add topics if user expresses confusion, asks unresolved questions, or shows 'worse' signals "
+    "(avoidance, fear/anxiety, or inability to generalize). Remove ONLY when user demonstrates scaffold-free mastery.\n"
+    
+    "- current_focus: { long_term_goals: [str], key_entries_of_interest: [str], persistent_open_questions: [str] }. \n"
+    "  Logic: 'long_term_goals' are high-level/abstract (e.g., 'Mastering Backend Dev'); update only via explicit "
+    "user input or strong repeated patterns. 'key_entries_of_interest' are the immediate active concepts from "
+    "this session. 'persistent_open_questions' tracks open questions or conceptual gaps; remove only upon clear evidence of resolution.\n"
+    
+    "- learning_preferences: { preferred_topics_and_interests: [str], preferred_learning_style: str, preferred_file_types: [str] }. \n"
+    "  Logic: 'preferred_topics_and_interests' captures broad affinities—including hobbies, recurring objects, "
+    "or themes mentioned (e.g., 'e-commerce', 'gaming', 'fast-paced'). 'preferred_learning_style' is a behavioral "
+    "inference (e.g., 'prefers real world examples, prefers code-first shortcuts').\n"
+    
+    "- user_profile: A 1-sentence behavioral snapshot. \n"
+    "  Logic: Summarize the user’s current mindset, background, and learning stance (e.g., 'A low-effort "
+    "beginner seeking practical shortcuts to bypass complex logic like recursion').\n\n"
+
+    "CONSTRAINT: Return ONLY the updated JSON. Be concise. Avoid redundant array items."
 )
+
+def _truncate_to_tokens(tokenizer: Any, text: str, max_tokens: int) -> str:
+    """
+    Truncate text to a maximum number of tokens using the provided tokenizer.
+    If no tokenizer is available, fallback to character-based truncation.
+    """
+    if not tokenizer:
+        return text[:max_tokens * 4]  # Rough estimate: 1 token ~= 4 chars
+    
+    try:
+        tokens = tokenizer.encode(text)
+        if len(tokens) <= max_tokens:
+            return text
+        return tokenizer.decode(tokens[:max_tokens])
+    except Exception:
+        return text[:max_tokens * 4]
 
 
 @dataclass
@@ -93,19 +152,31 @@ class KnowledgeProfileItem:
     weak_topics: str = ""
 
 @dataclass
+class LearningPreferences:
+    preferred_topics_and_interests: List[str] = field(default_factory=list)
+    preferred_learning_style: str = ""
+    preferred_file_types: List[str] = field(default_factory=list)
+
+@dataclass
+class CurrentFocus:
+    long_term_goals: List[str] = field(default_factory=list)
+    key_entries_of_interest: List[str] = field(default_factory=list)
+    persistent_open_questions: List[str] = field(default_factory=list)
+
+@dataclass
 class MemorySynopsisLong:
     """
     Structured memory containing the user's long-term learning profile (LTM_SCHEMA).
     """
     # knowledge_profile is a list of KnowledgeProfileItem objects
     knowledge_profile: List[KnowledgeProfileItem] = field(default_factory=list)
-    current_focus: str = ""
-    learning_preferences: str = ""
+    current_focus: CurrentFocus = field(default_factory=CurrentFocus)
+    learning_preferences: LearningPreferences = field(default_factory=LearningPreferences)
     user_profile: str = ""
 
     def to_json(self) -> str:
         """Converts the dataclass instance to a JSON string."""
-        # Custom serialization logic to handle the nested dataclass (KnowledgeProfileItem)
+        # asdict recursively converts nested dataclasses to dicts
         data = asdict(self)
         return json.dumps(data, ensure_ascii=False)
 
@@ -114,18 +185,34 @@ class MemorySynopsisLong:
         """Creates a MemorySynopsisLong instance from a JSON string."""
         data: Dict[str, Any] = json.loads(s or "{}")
         
-        # Manually deserialize the nested 'knowledge_profile' list of objects
+        # Deserialize knowledge_profile
+        knowledge_profiles = []
         knowledge_profiles_data = data.get("knowledge_profile", [])
-        knowledge_profiles = [
-            KnowledgeProfileItem(**item)
-            for item in knowledge_profiles_data
-        ]
+        if isinstance(knowledge_profiles_data, dict):
+             knowledge_profiles_data = [knowledge_profiles_data]
+        if isinstance(knowledge_profiles_data, list):
+            for item in knowledge_profiles_data:
+                if isinstance(item, dict):
+                    knowledge_profiles.append(KnowledgeProfileItem(**item))
         
-        # Remove the raw list data and insert the deserialized objects
-        data["knowledge_profile"] = knowledge_profiles
-        
-        # Use a safe method to initialize, filling defaults if keys are missing
-        return MemorySynopsisLong(**{k: data.get(k, v) for k, v in asdict(MemorySynopsisLong()).items()})
+        # Deserialize CurrentFocus
+        cf_data = data.get("current_focus", {})
+        if not isinstance(cf_data, dict): cf_data = {}
+        # Filter keys to match dataclass fields
+        valid_cf_keys = {f.name for f in field(default_factory=CurrentFocus).type.__dataclass_fields__.values()} if hasattr('', 'field') else CurrentFocus.__dataclass_fields__.keys()
+        current_focus = CurrentFocus(**{k: v for k, v in cf_data.items() if k in CurrentFocus.__dataclass_fields__})
+
+        # Deserialize LearningPreferences
+        lp_data = data.get("learning_preferences", {})
+        if not isinstance(lp_data, dict): lp_data = {}
+        learning_preferences = LearningPreferences(**{k: v for k, v in lp_data.items() if k in LearningPreferences.__dataclass_fields__})
+
+        return MemorySynopsisLong(
+            knowledge_profile=knowledge_profiles,
+            current_focus=current_focus,
+            learning_preferences=learning_preferences,
+            user_profile=data.get("user_profile", "")
+        )
 
 
 async def build_memory_synopsis(
@@ -174,6 +261,7 @@ async def _llm_synthesize_ltm(
         new_stm: MemorySynopsis,
         prev_ltm: Optional[MemorySynopsisLong],
         transcript: str,
+        course_code: str,
         max_prompt_tokens: int = 3500,
 ) -> MemorySynopsisLong:
     """
@@ -185,6 +273,9 @@ async def _llm_synthesize_ltm(
 
     # LTM_SYSTEM data structure
     LLM_USER_LTM_TEMPLATE = """
+COURSE_CODE:
+{course_code}
+
 EXISTING_LTM:
 {existing_ltm_json}
 
@@ -200,33 +291,23 @@ Produce the single best updated LTM JSON object following the system rules. Retu
 
     # Prepare system and user messages for LLM
     sys_msg = {"role": "system", "content": _LLM_SYSTEM_LTM}
-    print(f"STM : {new_stm_json}")
     usr_content = LLM_USER_LTM_TEMPLATE.format(
+        course_code=course_code,
         existing_ltm_json=existing_ltm_json,
         new_stm_json=new_stm_json,
         transcript=_truncate_to_tokens(tokenizer, transcript, max_prompt_tokens)
     )
-    usr = {"role": "user",
-           "content": usr_content}
-    # usr = {
-    #     "role": "user",
-    #     "content": _LLM_USER_TEMPLATE.format(
-    #         transcript=_truncate_to_tokens(tokenizer, transcript, max_prompt_tokens)
-    #     )
-    # }
+    usr = {"role": "user", "content": usr_content}
     chat = [sys_msg, usr]
-    # sys_msg = {"role": "system", "content": _LLM_MERGE_SYSTEM}
-    # usr_msg = {"role": "user", "content": _LLM_MERGE_USER_TEMPLATE.format(old_json=old_json, new_json=new_json)}
-    prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
-
-    text = ""
-    print(f"\n\nstart generating LTM \n\n")
-    async for chunk in engine.generate(
-            prompt=prompt,
-            sampling_params=SAMPLING_JSON_LTM,
-            request_id=str(time.time_ns())
-    ):
-        text = chunk.outputs[0].text
+    response = await engine.chat.completions.create(
+        model=settings.vllm_chat_model,
+        messages=chat,
+        temperature=0.0,
+        top_p=1.0,
+        extra_body={"guided_json": LTM_SCHEMA}
+    )
+    text = response.choices[0].message.content or "{}"
+    print("Generated LTM JSON:", text)
 
     try:
         # Using MemorySynopsisLong.from_json method to build a MemorySynopsisLong instance
@@ -243,6 +324,7 @@ async def build_memory_synopsis_long(
         tokenizer: Any,
         engine: Any,
         new_stm: MemorySynopsis, # 新增：必须是已生成的 Short-Term Memory
+        course_code: str,
         prev_synopsis_long: Optional[MemorySynopsisLong] = None, # LTM 历史
         chat_history_sid: Optional[str] = None,
         max_prompt_tokens: int = 3500,
@@ -275,7 +357,8 @@ async def build_memory_synopsis_long(
         new_stm,
         prev_synopsis_long,
         transcript,
-        max_prompt_tokens=max_prompt_tokens
+        course_code=course_code,
+        max_prompt_tokens=max_prompt_tokens,
     )
     return updated_ltm
 
@@ -301,40 +384,6 @@ _LLM_SYSTEM = (
     "- Extract explicit constraints (versions, dates, scope limits) as strings.\n"
 )
 
-_LLM_SYSTEM_LTM = (
-    "You are a Long-Term Memory (LTM) Synthesis Agent for a teaching platform.\n"
-    "Given the student's existing long-term memory, the new short-term memory from the latest session, and the full chat transcript, your task is to produce an updated LTM JSON that reflects the student's profile, knowledge state, and learning history.\n"
-
-    "Input Data:\n"
-    "1. EXISTING_LTM: The student's current comprehensive LTM JSON. (May be empty/null if this is the first session).\n"
-    "2. NEW_STM: The structured Short-Term Memory JSON from the recent session.\n"
-    "3. CHAT_HISTORY: The full text transcript of the conversation that generated the NEW_STM.\n"
-
-    "LTM JSON Keys and Update Logic:\n"
-
-    "1. user_id:\n"
-    "No need to be updated.\n"
-    
-    "2. knowledge_profile:\n"
-    "Including arrays of items, each items include course id and weak topics. An item for each courses.\n"
-
-    "3. current focus:\n"
-    "The user's current learning focus areas, updated based on the NEW_STM `focus` and `user_goals`.\n"
-    
-    "4. learning_preferences:\n"
-    "Some guide on how to response based on the user's learning preferences. Do not need to write down the specific reference number for this key.\n"
-    "Please do not change this item rapidly. Keep it stable over time unless there is strong evidence in the NEW_STM or CHAT_HISTORY indicating a significant change in the user's learning preferences.\n"
-
-    "5. user_profile:\n"
-    "The background knowledge of the user which can facilitate response and the user's learning.\n"
-    "Please do not change this item rapidly. Keep it stable over time unless there is strong evidence in the NEW_STM or CHAT_HISTORY indicating a significant change in the user's profile.\n"
-    
-    "Rules:\n"
-    "- Imagine the you are a teaching assistant that teaches this user. After reading the LTM you generated, you should have a better idea of how to teach this student."
-    "- Return ONLY a single updated LTM JSON object that strictly matches the provided schema and type requirements.\n"
-    "- Make each element long to ensure that the LTM is informative and useful for future sessions. No need to have too many items in an array, this is not recommended. A better way is to make each item more informative. 100 or more words is preferred for each item in an array.\n"
-    "- Ensure all required keys are present and follow their specified formats (e.g., `confidence_score` as a number 0.0-1.0).\n"
-)
 
 _LLM_USER_TEMPLATE = """Transcript:
 {transcript}
@@ -379,15 +428,12 @@ async def _llm_synopsis_from_transcript(
         messages=chat,
         temperature=0.0,
         top_p=1.0,
-        max_tokens=800,
-        response_format={"type": "json_object"},
         extra_body={"guided_json": MEMORY_SYNOPSIS_JSON_SCHEMA}
     )
 
     # vLLM with --reasoning-parser separates reasoning_content from content
     # Use content directly (final response without thinking)
     text = response.choices[0].message.content or "{}"
-    print('Generated MemorySynopsis JSON:', text)
     try:
         data = json.loads(text.strip())
     except json.JSONDecodeError:
@@ -462,8 +508,6 @@ async def _llm_merge_synopses(
         messages=chat,
         temperature=0.0,
         top_p=1.0,
-        max_tokens=800,
-        response_format={"type": "json_object"},
         extra_body={"guided_json": MEMORY_SYNOPSIS_JSON_SCHEMA}
     )
 

@@ -10,14 +10,16 @@ from datetime import datetime
 from typing import Optional, List, Any
 from uuid import uuid4
 import json
+import asyncio
+import time
 
 from app.core.mongodb_client import get_mongodb_client
 from app.core.models.memory_synopsis import MemorySynopsisDocument
 from app.core.models.chat_completion import Message
 from app.services.rag_postprocess import MemorySynopsis, build_memory_synopsis, MemorySynopsisLong, build_memory_synopsis_long
 from fastapi.responses import JSONResponse
-from app.services.rag_generation import format_chat_msg
 from app.dependencies.model import get_model_engine
+from app.services.chat_history_service import chat_history_service
 
 
 logger = logging.getLogger(__name__)
@@ -88,7 +90,6 @@ class MemorySynopsisService:
                 engine=engine,
                 chat_history_sid=chat_history_sid  # This triggers MongoDB lookup inside function
             )
-
             # Generate new memory synopsis SID
             memory_synopsis_sid = str(uuid4())
 
@@ -117,14 +118,14 @@ class MemorySynopsisService:
 
             if result.upserted_id or result.modified_count > 0:
                 print(f"[INFO] Successfully saved memory synopsis for chat_history_sid: {chat_history_sid}")
-                return memory_synopsis_sid
+                return memory_synopsis_sid, new_memory 
             else:
                 print(f"[INFO] Failed to save memory synopsis for chat_history_sid: {chat_history_sid}")
-                return None
+                return None, None
 
         except Exception as e:
             print(f"[INFO] Failed to create/update memory for SID {chat_history_sid}: {e}")
-            return None  # Graceful failure - next conversation round will try again
+            return None, None  # Graceful failure - next conversation round will try again
 
     def delete_by_chat_history_sid(self, chat_history_sid: str) -> bool:
         """
@@ -239,7 +240,8 @@ class MemorySynopsisServiceLong:
         messages: List[Message],
         new_stm: MemorySynopsis,
         engine: Any,
-        tokenizer: Any
+        tokenizer: Any,
+        course_code: str
     ) -> Optional[str]:
         """
         Create or update Long-Term Memory (LTM) for a user.
@@ -251,6 +253,7 @@ class MemorySynopsisServiceLong:
             new_stm: The newly generated Short-Term Memory for the current session.
             engine: LLM engine for LTM synthesis.
             tokenizer: Tokenizer for prompt processing.
+            course_code: The course code for the current session.
 
         Returns:
             ltm_synopsis_sid if successful, None if failed.
@@ -266,7 +269,8 @@ class MemorySynopsisServiceLong:
                 engine=engine,
                 new_stm=new_stm,
                 prev_synopsis_long=prev_ltm,
-                chat_history_sid=chat_history_sid # 传递 sid，尽管 LTM 是以 user_id 检索的
+                chat_history_sid=chat_history_sid,
+                course_code=course_code
             )
             print(f"[INFO] New LTM generated for user_id {user_id}: {new_ltm.to_json()}")
             # 3. 生成新的 LTM SID
@@ -365,8 +369,7 @@ async def create_or_update_memory_synopsis(
         sid: str,
         user_id: str, # 假设已在 GeneralCompletionParams, FileCompletionParams, PracticeCompletionParams 中添加
         messages: List[Message],
-        # course_code: str,
-        # _: bool = Depends(verify_api_token)
+        course_code: str,
 ):
     """
     Create or update memory synopsis (STM) for a chat history, and then synthesize
@@ -379,46 +382,30 @@ async def create_or_update_memory_synopsis(
         engine = get_model_engine()
         print(f"[INFO] Using engine: {engine}")
 
-        # Import TOKENIZER from rag_generation
-        from app.services.rag_generation import TOKENIZER
-
         # Initialize memory synopsis service
         stm_service = MemorySynopsisService()
         print("[INFO] STM Service initialized.")
         ltm_service = MemorySynopsisServiceLong()
         print("[INFO] LTM Service initialized.")
-        formatted_messages = format_chat_msg(messages)
-        print("[INFO] Messages formatted for memory synopsis.")
 
-        # 1. 步骤 a: 生成 Short-Term Memory (STM) 实例
-        # 这一步是为了获取 MemorySynopsis 实例 (new_stm) 供 LTM 使用
-        new_memory: MemorySynopsis = await build_memory_synopsis(
-            messages=formatted_messages,
-            tokenizer=TOKENIZER,
-            engine=engine,
-            chat_history_sid=sid # build_memory_synopsis 会自动检索旧的 STM
-        )
-        print("[INFO] Short-Term Memory (STM) instance built.")
-        # 2. 步骤 b: 存储/更新 Short-Term Memory (STM)
-        # 调用 STM 服务进行持久化。STM 服务内部会再次调用 build_memory_synopsis
-        memory_synopsis_sid = await stm_service.create_or_update_memory(
+        # generate and store STM
+        memory_synopsis_sid, new_memory = await stm_service.create_or_update_memory(
             chat_history_sid=sid,
-            messages=formatted_messages,
-            engine=engine,
-            tokenizer=TOKENIZER
+            messages=messages,
+            engine=engine
         )
-        print("[INFO] Short-Term Memory (STM) stored/updated.")
         ltm_synopsis_sid = None
-        # 3. 步骤 c: 如果 STM 成功，生成并存储 Long-Term Memory (LTM)
+
+        # generate and store LTM if STM is successfully generated
         if memory_synopsis_sid:
-            print(f"STM 1 : {new_memory}")
             ltm_synopsis_sid = await ltm_service.create_or_update_ltm(
                 user_id=user_id,
                 chat_history_sid=sid,
-                messages=formatted_messages,
-                new_stm=new_memory, # <--- 修正：传递第一步生成的 MemorySynopsis 实例
+                messages=messages,
+                new_stm=new_memory,
                 engine=engine,
-                tokenizer=TOKENIZER
+                tokenizer=None,
+                course_code=course_code
             )
         print("[INFO] Long-Term Memory (LTM) stored/updated.")
         # 4. 返回结果
@@ -441,3 +428,25 @@ async def create_or_update_memory_synopsis(
             "status": "failed",
             "message": "Memory generation failed due to internal error, will retry next round"
         })
+
+async def background_memory_update(sid: str, user_id: str, course_code: str):
+    """
+    Background task to update memory synopsis. 
+    First attempts to pull full history from MongoDB.
+    """
+    try:
+        # Attempt to pull full history from MongoDB
+        # TODO fix this in the future, now it's a hack, sleep for 3 seconds to ensure frontend update MongoDB
+        time.sleep(3)
+        full_history = await chat_history_service.get_messages_by_sid(sid)
+        
+        if not full_history:
+            print(f"ℹ️ [MemoryUpdate] No history found in MongoDB for SID {sid}")
+            return
+        else:
+            print(f"✅ [MemoryUpdate] Using {len(full_history)} messages from MongoDB for SID {sid}")
+
+        # Call the existing memory update service
+        await create_or_update_memory_synopsis(sid=sid, user_id=user_id, messages=full_history, course_code=course_code)
+    except Exception as e:
+        print(f"❌ [MemoryUpdate] Background memory update failed for SID {sid}: {e}")

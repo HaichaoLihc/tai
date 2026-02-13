@@ -108,7 +108,7 @@ def build_augmented_prompt(
     print('time of the day:', time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()), '\n')
     # No need to retrieve documents if rag is False
     if not rag:
-        return user_message, []
+        return user_message, [], ""
     # If query_message is not provided, use user_message
     if not query_message:
         query_message = user_message

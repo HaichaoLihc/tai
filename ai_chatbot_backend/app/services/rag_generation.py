@@ -9,8 +9,8 @@ from openai import OpenAI, AsyncOpenAI
 # Local libraries
 from app.core.models.chat_completion import Message, UserFocus
 from app.services.rag_preprocess import build_retrieval_query, build_augmented_prompt, build_file_augmented_context
+from app.services.memory_synopsis_service import MemorySynopsisServiceLong
 from app.config import settings
-
 
 # Sampling parameters for generation (used with OpenAI API)
 SAMPLING_PARAMS = {
@@ -32,7 +32,8 @@ async def generate_chat_response(
         top_k: int = 7,
         engine: Any = None,
         audio_response: bool = False,
-        sid: Optional[str] = None
+        sid: Optional[str] = None,
+        user_id: Optional[str] = None
 ) -> Tuple[Any, List[str | Any]]:
     """
     Build an augmented message with references and run LLM inference.
@@ -40,6 +41,16 @@ async def generate_chat_response(
     """
     # Build the query message based on the chat history
     t0 = time.time()
+
+    if user_id:
+        try:
+            memory_synopsis_service = MemorySynopsisServiceLong()
+            long_term_memory = await memory_synopsis_service.get_by_user_id(user_id)
+        except Exception as e:
+            print(f"[INFO] Failed to retrieve memory for query building, continuing without: {e}")
+            long_term_memory = None
+    else:
+        long_term_memory = None
 
     messages = format_chat_msg(messages)
 
@@ -95,8 +106,12 @@ async def generate_chat_response(
         query_message=query_message,
         audio_response=audio_response
     )
+    long_term_memory_instruction = ""
+    if long_term_memory:
+        long_term_memory_instruction = "\n\n" + "User's long-term memory: " + str(long_term_memory)
+        
     # Update the last message with the modified content
-    messages[-1].content += modified_message
+    messages[-1].content += modified_message + long_term_memory_instruction
     messages[0].content += system_add_message
     # Generate the response using the engine
     if _is_openai_client(engine):

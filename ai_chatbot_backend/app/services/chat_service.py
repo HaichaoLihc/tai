@@ -160,16 +160,8 @@ async def chat_stream_parser(
                             }
                         ],
                     })
-
-    # # convert token ids to text
-    # print("\n[INFO] Full response text:")
-    # from transformers import AutoTokenizer
-    # TOKENIZER_MODEL_ID = "openai/gpt-oss-20b"
-    # TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_MODEL_ID)
-    # full_response_text = TOKENIZER.decode(token, skip_special_tokens=False)
-    # print(full_response_text)
-    await create_or_update_memory_synopsis(old_sid, user_id, response_messages)
-
+    
+    # Extract and yield references from the final content
     pattern = re.compile(
         r'(?:\[Reference:\s*([\d,\s]+)\]'
         r'|\breference\s+(\d+(?:(?:\s*,\s*|\s*(?:and|&)\s*)\d+)*))',
